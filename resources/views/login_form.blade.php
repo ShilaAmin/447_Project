@@ -17,6 +17,14 @@
       @if(session('error')) <div class="alert alert-danger">{{ session('error') }}</div> @endif
       @if(session('success')) <div class="alert alert-success">{{ session('success') }}</div> @endif
 
+      @if(session('otp_secret'))
+        <div class="alert alert-info">
+          <p class="mb-2"><strong>Save your 2FA secret:</strong> <code>{{ session('otp_secret') }}</code></p>
+          <p class="mb-2 small">Add it in Google Authenticator / Authy (manual entry), or open this otpauth URL:</p>
+          <p class="small text-break mb-0"><a href="{{ session('otp_qr') }}">{{ session('otp_qr') }}</a></p>
+        </div>
+      @endif
+
       <form method="POST" action="{{ url('/login') }}">
         @csrf
         <div class="mb-3">

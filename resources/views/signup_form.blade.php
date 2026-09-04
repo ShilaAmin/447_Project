@@ -34,6 +34,11 @@
           @error('phone') <small class="text-danger">{{ $message }}</small> @enderror
         </div>
         <div class="mb-3">
+          <label class="form-label fw-semibold">Address</label>
+          <input type="text" name="address" value="{{ old('address') }}" required class="form-control @error('address') is-invalid @enderror" />
+          @error('address') <small class="text-danger">{{ $message }}</small> @enderror
+        </div>
+        <div class="mb-3">
           <label class="form-label fw-semibold">NID Number</label>
           <input type="text" name="nid_no" value="{{ old('nid_no') }}" required class="form-control @error('nid_no') is-invalid @enderror" />
           @error('nid_no') <small class="text-danger">{{ $message }}</small> @enderror

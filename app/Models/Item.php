@@ -10,7 +10,15 @@ class Item extends Model
     use HasFactory;
 
     protected $fillable = [
-        'user_id', 'category_id', 'title', 'description', 'preferred_product', 'photo'
+        'user_id',
+        'category_id',
+        'title',
+        'description',
+        'preferred_product',
+        'photo',
+        'mac',
+        'image_meta',
+        'image_meta_mac',
     ];
 
     public function user()

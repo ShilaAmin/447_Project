@@ -30,7 +30,14 @@
             "App\\": "app/",
             "Database\\Factories\\": "database/factories/",
             "Database\\Seeders\\": "database/seeders/"
-        }
+        },
+        "classmap": [
+            "app/Services/ProfileSecurity.php",
+            "app/Services/ItemSecurity.php",
+            "app/Services/PostSecurity.php",
+            "app/Services/NotificationService.php",
+            "app/Services/ExchangeRequestSecurity.php"
+        ]
     },
     "autoload-dev": {
         "psr-4": {

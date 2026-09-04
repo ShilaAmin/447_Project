@@ -37,6 +37,12 @@
     </div>
 
     <div class="mb-3">
+      <label class="form-label">Address</label>
+      <input type="text" name="address" value="{{ old('address', $user->address ?? '') }}" class="form-control @error('address') is-invalid @enderror" required>
+      @error('address') <small class="text-danger">{{ $message }}</small> @enderror
+    </div>
+
+    <div class="mb-3">
       <label class="form-label">NID Number</label>
       <input type="text" name="nid_no" value="{{ old('nid_no', $user->nid_no) }}" class="form-control @error('nid_no') is-invalid @enderror" required>
       @error('nid_no') <small class="text-danger">{{ $message }}</small> @enderror

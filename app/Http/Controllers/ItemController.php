@@ -6,6 +6,9 @@ use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Storage;
 use App\Models\Item;
 use App\Models\Category;
+use App\Services\ItemSecurity;
+use App\Services\NotificationService;
+use RuntimeException;
 
 class ItemController extends Controller
 {
@@ -19,7 +22,7 @@ class ItemController extends Controller
         return view('items.create', compact('categories'));
     }
 
-    public function store(Request $request)
+    public function store(Request $request, ItemSecurity $security)
     {
         if (!session()->has('user_id')) {
             return redirect('/login')->with('error', 'Please login first.');
@@ -34,16 +37,28 @@ class ItemController extends Controller
         ]);
 
         $category  = Category::firstOrCreate(['name' => $request->category]);
-        $photoPath = $request->file('photo')->store('uploads', 'public');
+        $file = $request->file('photo');
+        $photoPath = $file->store('uploads', 'public');
 
-        Item::create([
-            'user_id'           => session('user_id'),
-            'category_id'       => $category->id,
-            'title'             => $request->title,
-            'description'       => $request->description,
+        $fields = $security->encryptFields([
+            'title' => $request->title,
+            'description' => $request->description,
             'preferred_product' => $request->preferred_product,
-            'photo'             => $photoPath
         ]);
+
+        $meta = $security->encryptImageMeta([
+            'original_name' => $file->getClientOriginalName(),
+            'mime' => $file->getMimeType(),
+            'size' => $file->getSize(),
+            'path' => $photoPath,
+            'uploaded_at' => now()->toIso8601String(),
+        ]);
+
+        Item::create(array_merge([
+            'user_id'     => session('user_id'),
+            'category_id' => $category->id,
+            'photo'       => $photoPath,
+        ], $fields, $meta));
 
         return redirect('/dashboard')->with('success', 'Item submitted successfully!');
     }
@@ -58,56 +73,93 @@ class ItemController extends Controller
         return view('items.search', compact('categories'));
     }
 
-    public function searchResults(Request $request)
+    public function searchResults(Request $request, ItemSecurity $security)
     {
         if (!session()->has('user_id')) {
             return redirect('/login')->with('error', 'Please login first.');
         }
 
         $categoryName = $request->category;
-        $category     = Category::where('name', $categoryName)->first();
+        $keyword = trim((string) $request->keyword);
 
-        if (!$category) {
-            return redirect()->back()->with('error', 'Category not found.');
+        $query = Item::with(['user', 'category']);
+
+        if ($categoryName) {
+            $category = Category::where('name', $categoryName)->first();
+            if (!$category) {
+                return redirect()->back()->with('error', 'Category not found.');
+            }
+            $query->where('category_id', $category->id);
         }
 
-        $items = $category->items()->get();
+        $paginator = $query->orderBy('created_at', 'desc')->paginate(9)->withQueryString();
 
-        $userItems = [];
-        if (session()->has('user_id')) {
-            $userItems = Item::where('user_id', session('user_id'))->get();
-        }
+        $paginator->getCollection()->transform(function ($item) use ($security, $keyword) {
+            $hydrated = $security->hydrateDecrypted($item);
+            if (!$hydrated) {
+                return null;
+            }
 
-        $userRequestedItemIds = [];
-        if (session()->has('user_id')) {
-            $userRequestedItemIds = \App\Models\ExchangeRequest::where('requested_by', session('user_id'))
-                ->pluck('item_id')->toArray();
-        }
+            if ($keyword !== '') {
+                $hay = strtolower($hydrated->title . ' ' . $hydrated->description);
+                if (!str_contains($hay, strtolower($keyword))) {
+                    return null;
+                }
+            }
 
-        $isAdmin = session('user_email') === 'admin@gmail.com';
+            return $hydrated;
+        });
+        $paginator->setCollection($paginator->getCollection()->filter()->values());
 
-        return view('items.search_results', compact(
-            'items', 'categoryName', 'userItems', 'userRequestedItemIds', 'isAdmin'
-        ));
+        $userItems = Item::where('user_id', session('user_id'))->get()
+            ->map(fn ($i) => $security->hydrateTitle($i))
+            ->filter();
+
+        $userRequestedItemIds = \App\Models\ExchangeRequest::where('requested_by', session('user_id'))
+            ->pluck('item_id')->toArray();
+
+        $isAdmin = (bool) session('is_admin');
+
+        return view('items.search_results', [
+            'items' => $paginator,
+            'categoryName' => $categoryName ?: 'All',
+            'keyword' => $keyword,
+            'userItems' => $userItems,
+            'userRequestedItemIds' => $userRequestedItemIds,
+            'isAdmin' => $isAdmin,
+        ]);
     }
 
-    // ---------- MY ITEMS (list) ----------
-    public function myItems()
-    {
-        if (!session()->has('user_id')) {
-            return redirect('/login')->with('error', 'Please login first.');
-        }
-
-        $items = Item::with('category')
-            ->where('user_id', session('user_id'))
-            ->orderBy('created_at', 'desc')
-            ->paginate(12);
-
-        return view('items.my', compact('items'));
+    public function myItems(ItemSecurity $security)
+{
+    if (!session()->has('user_id')) {
+        return redirect('/login')->with('error', 'Please login first.');
     }
 
-    // ---------- EDIT ----------
-    public function edit($id)
+    $paginator = Item::with('category')
+        ->where('user_id', session('user_id'))
+        ->orderBy('created_at', 'desc')
+        ->paginate(12);
+
+    $paginator->getCollection()->transform(function ($item) use ($security) {
+
+        $hydrated = $security->hydrateDecrypted($item);
+
+        if (!$hydrated) {
+            $item->title = 'Integrity verification failed';
+            $item->description = '';
+            $item->preferred_product = '';
+
+            return $item;
+        }
+
+        return $hydrated;
+    });
+
+    return view('items.my', ['items' => $paginator]);
+}
+
+    public function edit($id, ItemSecurity $security)
     {
         if (!session()->has('user_id')) {
             return redirect('/login')->with('error', 'Please login first.');
@@ -115,17 +167,25 @@ class ItemController extends Controller
 
         $item = Item::findOrFail($id);
 
-        // Owner only (allow admin too if you prefer)
         if ($item->user_id != session('user_id')) {
             abort(403, 'Unauthorized');
         }
+
+        try {
+            $plain = $security->decryptFields($item);
+        } catch (RuntimeException $e) {
+            return redirect()->route('items.mine')->with('error', 'Item integrity check failed.');
+        }
+
+        $item->title = $plain['title'];
+        $item->description = $plain['description'];
+        $item->preferred_product = $plain['preferred_product'];
 
         $categories = Category::all();
         return view('items.edit', compact('item', 'categories'));
     }
 
-    // ---------- UPDATE ----------
-    public function update(Request $request, $id)
+    public function update(Request $request, $id, ItemSecurity $security)
     {
         if (!session()->has('user_id')) {
             return redirect('/login')->with('error', 'Please login first.');
@@ -135,6 +195,12 @@ class ItemController extends Controller
 
         if ($item->user_id != session('user_id')) {
             abort(403, 'Unauthorized');
+        }
+
+        try {
+            $security->assertItemIntegrity($item);
+        } catch (RuntimeException $e) {
+            return redirect()->route('items.mine')->with('error', 'Item integrity check failed.');
         }
 
         $request->validate([
@@ -151,37 +217,62 @@ class ItemController extends Controller
             if ($item->photo) {
                 Storage::disk('public')->delete($item->photo);
             }
-            $item->photo = $request->file('photo')->store('uploads', 'public');
+            $file = $request->file('photo');
+            $item->photo = $file->store('uploads', 'public');
+            $meta = $security->encryptImageMeta([
+                'original_name' => $file->getClientOriginalName(),
+                'mime' => $file->getMimeType(),
+                'size' => $file->getSize(),
+                'path' => $item->photo,
+                'uploaded_at' => now()->toIso8601String(),
+            ]);
+            $item->image_meta = $meta['image_meta'];
+            $item->image_meta_mac = $meta['image_meta_mac'];
         }
 
-        $item->category_id       = $category->id;
-        $item->title             = $request->title;
-        $item->description       = $request->description;
-        $item->preferred_product = $request->preferred_product;
+        $fields = $security->encryptFields([
+            'title' => $request->title,
+            'description' => $request->description,
+            'preferred_product' => $request->preferred_product,
+        ]);
+
+        $item->category_id = $category->id;
+        $item->title = $fields['title'];
+        $item->description = $fields['description'];
+        $item->preferred_product = $fields['preferred_product'];
+        $item->mac = $fields['mac'];
         $item->save();
 
         return redirect()->route('items.mine')->with('success', 'Item updated successfully.');
     }
 
-    // ---------- DELETE (owner or admin) ----------
-    public function destroy($itemId)
+    public function destroy($itemId, ItemSecurity $security, NotificationService $notifications)
     {
         $item = Item::with('user')->findOrFail($itemId);
 
         $isOwner = session('user_id') && $item->user_id == session('user_id');
-        $isAdmin = session('user_email') === 'admin@gmail.com';
+        $isAdmin = (bool) session('is_admin');
 
         if (!$isOwner && !$isAdmin) {
             abort(403, 'Unauthorized action.');
         }
 
-        // notify owner if admin deletes
-        if ($isAdmin && !$isOwner) {
-            \App\Models\Notification::create([
-                'user_id' => $item->user->id,
-                'message' => "Your item '{$item->title}' was DELETED by Admin.",
-                'read'    => 0,
-            ]);
+        try {
+            $security->assertItemIntegrity($item);
+            $plain = $security->decryptFields($item);
+            $title = $plain['title'];
+        } catch (RuntimeException $e) {
+            if (!$isAdmin) {
+                return redirect()->back()->with('error', 'Item integrity check failed.');
+            }
+            $title = '[integrity-failed]';
+        }
+
+        if ($isAdmin && !$isOwner && $item->user) {
+            $notifications->push(
+                $item->user->id,
+                "Your item '{$title}' was DELETED by Admin."
+            );
         }
 
         if ($item->photo) {

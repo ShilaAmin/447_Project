@@ -49,6 +49,16 @@
         </div>
       </div>
 
+      <div class="col-md-4">
+        <div class="card h-100 border-0 shadow-sm">
+          <div class="card-body d-flex flex-column">
+            <h5 class="card-title">Categories</h5>
+            <p class="card-text">Create, edit, or delete item categories.</p>
+            <a href="{{ route('admin.categories') }}" class="btn btn-brand mt-auto">Open</a>
+          </div>
+        </div>
+      </div>
+
       <!-- NEW: Profile Settings -->
       <div class="col-md-4">
         <div class="card h-100 border-0 shadow-sm">
