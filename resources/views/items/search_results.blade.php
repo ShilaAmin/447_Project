@@ -23,12 +23,20 @@
 
   @php
     // ensure $isAdmin is set (controller already passes it, but keep fallback)
-    $isAdmin = isset($isAdmin) ? $isAdmin : (session('user_email') === 'admin@gmail.com');
+    $isAdmin = isset($isAdmin) ? $isAdmin : (bool) session('is_admin');
   @endphp
 
   <div class="container mt-5">
     <div class="d-flex flex-wrap justify-content-between align-items-end gap-2 mb-3">
-      <h3 class="mb-0">Items in <span class="brand-gradient fw-bold">{{ $categoryName }}</span></h3>
+      <h3 class="mb-0">
+        Search results
+        @if(!empty($categoryName) && $categoryName !== 'All')
+          in <span class="brand-gradient fw-bold">{{ $categoryName }}</span>
+        @endif
+        @if(!empty($keyword))
+          for “{{ $keyword }}”
+        @endif
+      </h3>
       <a href="{{ route('items.search.form') }}" class="btn btn-outline-secondary btn-sm">Back to Search</a>
     </div>
 
@@ -102,6 +110,7 @@
           </div>
         @endforeach
       </div>
+      <div class="mt-4">{{ $items->links() }}</div>
     @endif
   </div>
 </body>
