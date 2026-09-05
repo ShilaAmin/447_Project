@@ -8,14 +8,17 @@ use Illuminate\Support\Facades\DB;
 
 use App\Models\ExchangeRequest;
 use App\Models\Item;
-use App\Models\Notification;
 use App\Models\User;
 use App\Models\TradeOffer;
+use App\Services\ExchangeRequestSecurity;
+use App\Services\ItemSecurity;
+use App\Services\NotificationService;
+use App\Services\ProfileSecurity;
+use RuntimeException;
 
 class ExchangeRequestController extends Controller
 {
-    // Store a trade request (NO contact info in notification)
-    public function store(Request $request, $id)
+    public function store(Request $request, $id, ExchangeRequestSecurity $security, ItemSecurity $items, NotificationService $notifications)
     {
         if (!session()->has('user_id')) {
             return redirect('/login')->with('error', 'You must be logged in to request a trade.');
@@ -27,7 +30,6 @@ class ExchangeRequestController extends Controller
             'offered_item_id' => 'nullable|exists:items,id'
         ]);
 
-        // Load item WITH owner (user)
         $item = Item::with('user')->find($id);
         if (!$item) {
             return redirect()->back()->with('error', 'Item not found.');
@@ -37,7 +39,6 @@ class ExchangeRequestController extends Controller
             return redirect()->back()->with('error', 'You cannot request your own item.');
         }
 
-        // Prevent duplicate request
         $exists = ExchangeRequest::where('item_id', $id)
             ->where('requested_by', $userId)
             ->first();
@@ -46,38 +47,45 @@ class ExchangeRequestController extends Controller
             return redirect()->back()->with('error', 'You have already requested this item.');
         }
 
+        $status = 'pending';
+        $encryptedDetails = $security->encryptDetails([
+            'item_id' => (int) $id,
+            'requested_by' => $userId,
+            'offered_item_id' => $request->offered_item_id ? (int) $request->offered_item_id : null,
+            'created_at' => now()->toIso8601String(),
+        ]);
+
         $exchangeRequest = ExchangeRequest::create([
             'item_id' => $id,
             'requested_by' => $userId,
             'offered_item_id' => $request->offered_item_id ?? null,
-            'status' => 'pending',
+            'encrypted_details' => $encryptedDetails,
+            'mac' => $security->generateMac($encryptedDetails, $status),
+            'status' => $status,
         ]);
 
-        // 🔔 Notify the item owner about the new request (NO personal contact details here)
-        $requester = User::find($userId);
+        $plainItem = $items->hydrateTitle($item);
+        $itemTitle = $plainItem?->title ?? 'item';
+        $requesterName = session('user_name') ?? 'A user';
+
         $offeredTitle = null;
         if (!empty($exchangeRequest->offered_item_id)) {
             $offered = Item::find($exchangeRequest->offered_item_id);
-            $offeredTitle = $offered?->title;
+            $offeredTitle = $offered ? ($items->hydrateTitle($offered)?->title) : null;
         }
 
-        $message = "New trade request for '{$item->title}' from {$requester->name}.";
+        $message = "New trade request for '{$itemTitle}' from {$requesterName}.";
         if ($offeredTitle) {
             $message .= " Offered item: {$offeredTitle}.";
         }
         $message .= " Open your Requests page to review.";
 
-        Notification::create([
-            'user_id' => $item->user->id, // owner
-            'message' => $message,
-            'read'    => 0,
-        ]);
+        $notifications->push($item->user->id, $message);
 
         return redirect()->back()->with('success', 'Trade request sent successfully!');
     }
 
-    // List incoming requests for owner
-    public function index()
+    public function index(ItemSecurity $items, ExchangeRequestSecurity $security, ProfileSecurity $profiles)
     {
         if (!session()->has('user_id')) {
             return redirect('/login')->with('error', 'You must be logged in to view requests.');
@@ -85,16 +93,32 @@ class ExchangeRequestController extends Controller
 
         $userId = session('user_id');
 
-        $requests = ExchangeRequest::whereHas('item', function($q) use ($userId) {
+        $requests = ExchangeRequest::whereHas('item', function ($q) use ($userId) {
             $q->where('user_id', $userId);
         })->with(['item', 'requester', 'offeredItem'])
           ->orderBy('created_at', 'desc')
-          ->get();
+          ->paginate(10);
+
+        $requests->getCollection()->transform(function ($er) use ($security, $items, $profiles) {
+            if ($er->encrypted_details && $er->mac && !$security->verifyMac($er->encrypted_details, $er->status, $er->mac, $er->completion_payload)) {
+                return $er;
+            }
+            if ($er->item) {
+                $er->setRelation('item', $items->hydrateTitle($er->item) ?? $er->item);
+            }
+            if ($er->offeredItem) {
+                $er->setRelation('offeredItem', $items->hydrateTitle($er->offeredItem) ?? $er->offeredItem);
+            }
+            if ($er->requester) {
+                $er->setRelation('requester', $profiles->hydrateName($er->requester));
+            }
+            return $er;
+        });
 
         return view('requests.index', compact('requests'));
     }
 
-    public function myRequests()
+    public function myRequests(ItemSecurity $items, ExchangeRequestSecurity $security)
     {
         if (!session()->has('user_id')) {
             return redirect('/login')->with('error', 'You must be logged in to view your requests.');
@@ -102,80 +126,131 @@ class ExchangeRequestController extends Controller
 
         $userId = session('user_id');
 
-        // Requests that *you* sent
-        $requests = \App\Models\ExchangeRequest::with(['item', 'offeredItem'])
+        $requests = ExchangeRequest::with(['item', 'offeredItem'])
             ->where('requested_by', $userId)
             ->orderBy('created_at', 'desc')
-            ->get();
+            ->paginate(10);
+
+        $requests->getCollection()->transform(function ($er) use ($items, $security) {
+            if ($er->encrypted_details && $er->mac && !$security->verifyMac($er->encrypted_details, $er->status, $er->mac, $er->completion_payload)) {
+                return $er;
+            }
+            if ($er->item) {
+                $er->setRelation('item', $items->hydrateTitle($er->item) ?? $er->item);
+            }
+            if ($er->offeredItem) {
+                $er->setRelation('offeredItem', $items->hydrateTitle($er->offeredItem) ?? $er->offeredItem);
+            }
+            return $er;
+        });
 
         return view('requests.my', compact('requests'));
     }
 
-    // Accept a request → notify requester WITH OWNER CONTACT INFO (contact shared here only)
-    public function accept($id)
+    public function accept($id, ExchangeRequestSecurity $security, ItemSecurity $items, NotificationService $notifications, ProfileSecurity $profiles)
     {
-        // Load the request with item & owner
         $exchangeRequest = ExchangeRequest::with(['item.user'])->findOrFail($id);
 
-        // Only the item owner can accept
         if (!session()->has('user_id') || $exchangeRequest->item->user_id != session('user_id')) {
             return redirect()->back()->with('error', 'Unauthorized.');
         }
 
-        // Update status (+ timestamp column if you added it)
+        try {
+            $security->assertIntegrity(
+                $exchangeRequest->encrypted_details,
+                $exchangeRequest->status,
+                $exchangeRequest->mac,
+                $exchangeRequest->completion_payload
+            );
+        } catch (RuntimeException $e) {
+            return redirect()->back()->with('error', 'Request integrity check failed.');
+        }
+
         $exchangeRequest->status = 'accepted';
         if (Schema::hasColumn('exchange_requests', 'accepted_at')) {
             $exchangeRequest->accepted_at = now();
         }
+        $exchangeRequest->mac = $security->generateMac(
+            $exchangeRequest->encrypted_details,
+            $exchangeRequest->status,
+            $exchangeRequest->completion_payload
+        );
         $exchangeRequest->save();
 
-        // Owner contact details
         $owner = $exchangeRequest->item->user;
-        $ownerName  = $owner->name  ?? 'Owner';
-        $ownerEmail = $owner->email ?? '—';
-        $ownerPhone = $owner->phone ?? '—';
+        try {
+            $ownerPlain = $profiles->decryptProfile($owner);
+            $ownerName = $ownerPlain['name'];
+            $ownerEmail = $ownerPlain['email'];
+            $ownerPhone = $ownerPlain['phone'];
+        } catch (RuntimeException $e) {
+            $ownerName = session('user_name') ?? 'Owner';
+            $ownerEmail = '—';
+            $ownerPhone = '—';
+        }
 
-        // Notify requester including contact info
-        \App\Models\Notification::create([
-            'user_id' => $exchangeRequest->requested_by,
-            'message' =>
-                "Your offer for '{$exchangeRequest->item->title}' was ACCEPTED.\n".
-                "Owner: {$ownerName}\n".
-                "Email: {$ownerEmail}\n".
-                "Phone: {$ownerPhone}",
-            'read' => 0,
-        ]);
+        $itemTitle = $items->hydrateTitle($exchangeRequest->item)?->title ?? 'item';
+
+        $notifications->push(
+            $exchangeRequest->requested_by,
+            "Your offer for '{$itemTitle}' was ACCEPTED.\nOwner: {$ownerName}\nEmail: {$ownerEmail}\nPhone: {$ownerPhone}"
+        );
 
         return redirect()->back()->with('success', 'Request accepted and requester notified with contact info.');
     }
 
-    // ✅ Mark request as completed → keep the request row (for stats), remove item from listings
-    public function complete($id)
+    public function complete($id, ExchangeRequestSecurity $security, ItemSecurity $items, NotificationService $notifications)
     {
         $exchangeRequest = ExchangeRequest::with('item.user')->findOrFail($id);
 
-        // Only item owner can complete
-        if (!session()->has('user_id') || $exchangeRequest->item->user_id != session('user_id')) {
+        if (!session()->has('user_id') || !$exchangeRequest->item || $exchangeRequest->item->user_id != session('user_id')) {
             return redirect()->back()->with('error', 'Unauthorized.');
         }
 
-        // Mark the request as completed and set completed_at
+        try {
+            $security->assertIntegrity(
+                $exchangeRequest->encrypted_details,
+                $exchangeRequest->status,
+                $exchangeRequest->mac,
+                $exchangeRequest->completion_payload
+            );
+        } catch (RuntimeException $e) {
+            return redirect()->back()->with('error', 'Request integrity check failed.');
+        }
+
+        $plainItem = $items->hydrateTitle($exchangeRequest->item);
+        $itemTitle = $plainItem?->title ?? 'item';
+        $previousStatus = $exchangeRequest->status;
+
+        $completionPayload = $security->encryptCompletion([
+            'exchange_request_id' => $exchangeRequest->id,
+            'item_id' => $exchangeRequest->item_id,
+            'item_title' => $itemTitle,
+            'owner_id' => $exchangeRequest->item->user_id,
+            'requester_id' => $exchangeRequest->requested_by,
+            'offered_item_id' => $exchangeRequest->offered_item_id,
+            'completed_at' => now()->toIso8601String(),
+            'previous_status' => $previousStatus,
+        ]);
+
         $exchangeRequest->status = 'completed';
+        $exchangeRequest->completion_payload = $completionPayload;
         if (Schema::hasColumn('exchange_requests', 'completed_at')) {
             $exchangeRequest->completed_at = now();
         }
+        $exchangeRequest->mac = $security->generateMac(
+            $exchangeRequest->encrypted_details,
+            $exchangeRequest->status,
+            $exchangeRequest->completion_payload
+        );
         $exchangeRequest->save();
 
-        $owner = $exchangeRequest->item->user;
+        $ownerName = session('user_name') ?? 'Owner';
+        $notifications->push(
+            $exchangeRequest->requested_by,
+            "Trade for '{$itemTitle}' has been COMPLETED by {$ownerName}. Item removed from listings."
+        );
 
-        Notification::create([
-            'user_id' => $exchangeRequest->requested_by,
-            'message' => "Trade for '{$exchangeRequest->item->title}' has been COMPLETED by {$owner->name}. Item removed from listings.",
-            'read'    => 0,
-        ]);
-
-        // Remove the item from listings, but KEEP the exchange request record
-        // Because we changed FK to ON DELETE SET NULL, the request survives.
         if ($exchangeRequest->item) {
             $exchangeRequest->item->delete();
         }
@@ -183,68 +258,114 @@ class ExchangeRequestController extends Controller
         return redirect()->back()->with('success', 'Trade completed, item removed, requester notified.');
     }
 
-    // Decline request → notify requester (no contact info)
-    public function decline($id)
+    public function decline($id, ExchangeRequestSecurity $security, ItemSecurity $items, NotificationService $notifications)
     {
         $exchangeRequest = ExchangeRequest::with(['item.user', 'requester'])->find($id);
         if (!$exchangeRequest) {
             return redirect()->back()->with('error', 'Request not found.');
         }
 
-        // Only owner can decline
         if (!session()->has('user_id') || $exchangeRequest->item->user_id != session('user_id')) {
             return redirect()->back()->with('error', 'Unauthorized.');
         }
 
+        try {
+            $security->assertIntegrity(
+                $exchangeRequest->encrypted_details,
+                $exchangeRequest->status,
+                $exchangeRequest->mac,
+                $exchangeRequest->completion_payload
+            );
+        } catch (RuntimeException $e) {
+            return redirect()->back()->with('error', 'Request integrity check failed.');
+        }
+
         $exchangeRequest->status = 'declined';
+        $exchangeRequest->mac = $security->generateMac(
+            $exchangeRequest->encrypted_details,
+            $exchangeRequest->status,
+            $exchangeRequest->completion_payload
+        );
         $exchangeRequest->save();
 
-        Notification::create([
-            'user_id' => $exchangeRequest->requested_by,
-            'message' => "Your trade request for '{$exchangeRequest->item->title}' has been DECLINED by {$exchangeRequest->item->user->name}.",
-            'read'    => 0,
-        ]);
+        $itemTitle = $items->hydrateTitle($exchangeRequest->item)?->title ?? 'item';
+        $ownerName = session('user_name') ?? 'Owner';
+
+        $notifications->push(
+            $exchangeRequest->requested_by,
+            "Your trade request for '{$itemTitle}' has been DECLINED by {$ownerName}."
+        );
 
         return redirect()->back()->with('success', 'Request declined and requester notified!');
     }
 
-    /* ==========================
-       Negotiation (Offers & Counters)
-       ========================== */
-
-    // open the negotiation thread view
-    public function negotiate($id)
+    public function negotiate($id, ItemSecurity $items, ExchangeRequestSecurity $security, ProfileSecurity $profiles)
     {
         if (!session()->has('user_id')) {
             return redirect('/login')->with('error', 'You must be logged in.');
         }
 
         $userId = session('user_id');
-
         $exchangeRequest = ExchangeRequest::with(['item.user', 'requester', 'offeredItem'])->findOrFail($id);
 
-        // Only the requester or the item owner can view the negotiation
+        if ($exchangeRequest->encrypted_details && $exchangeRequest->mac) {
+            try {
+                $security->assertIntegrity(
+                    $exchangeRequest->encrypted_details,
+                    $exchangeRequest->status,
+                    $exchangeRequest->mac,
+                    $exchangeRequest->completion_payload
+                );
+            } catch (RuntimeException $e) {
+                return redirect()->back()->with('error', 'Request integrity check failed.');
+            }
+        }
+
         if ($exchangeRequest->requested_by !== $userId && $exchangeRequest->item->user_id !== $userId) {
             return redirect()->back()->with('error', 'Unauthorized.');
         }
 
-        // guard: if table doesn't exist yet, show helpful message
         if (!Schema::hasTable('trade_offers')) {
             return redirect()->back()->with('error', 'Negotiation feature not initialized. Please run: php artisan migrate');
+        }
+
+        if ($exchangeRequest->item) {
+            $hydratedItem = $items->hydrateTitle($exchangeRequest->item) ?? $exchangeRequest->item;
+            if ($hydratedItem->relationLoaded('user') || $hydratedItem->user) {
+                $hydratedItem->setRelation('user', $profiles->hydrateName($hydratedItem->user));
+            }
+            $exchangeRequest->setRelation('item', $hydratedItem);
+        }
+
+        if ($exchangeRequest->requester) {
+            $exchangeRequest->setRelation('requester', $profiles->hydrateName($exchangeRequest->requester));
         }
 
         $offers = TradeOffer::with(['fromUser', 'toUser', 'offeredItem'])
             ->where('exchange_request_id', $exchangeRequest->id)
             ->orderBy('created_at', 'asc')
-            ->get();
+            ->get()
+            ->map(function ($offer) use ($profiles, $items) {
+                if ($offer->fromUser) {
+                    $offer->setRelation('fromUser', $profiles->hydrateName($offer->fromUser));
+                }
+                if ($offer->toUser) {
+                    $offer->setRelation('toUser', $profiles->hydrateName($offer->toUser));
+                }
+                if ($offer->offeredItem) {
+                    $offer->setRelation('offeredItem', $items->hydrateTitle($offer->offeredItem) ?? $offer->offeredItem);
+                }
+                return $offer;
+            });
 
-        $myItems = Item::where('user_id', $userId)->orderBy('created_at', 'desc')->get();
+        $myItems = Item::where('user_id', $userId)->orderBy('created_at', 'desc')->get()
+            ->map(fn ($i) => $items->hydrateTitle($i))
+            ->filter();
 
         return view('requests.negotiate', compact('exchangeRequest', 'offers', 'myItems', 'userId'));
     }
 
-    // send a new offer or counter-offer
-    public function sendOffer(Request $request, $id)
+    public function sendOffer(Request $request, $id, NotificationService $notifications, ItemSecurity $items)
     {
         if (!session()->has('user_id')) {
             return redirect('/login')->with('error', 'You must be logged in.');
@@ -253,7 +374,6 @@ class ExchangeRequestController extends Controller
 
         $exchangeRequest = ExchangeRequest::with(['item.user', 'requester'])->findOrFail($id);
 
-        // Only requester or owner can send offers
         $isRequester = ($exchangeRequest->requested_by === $userId);
         $isOwner = ($exchangeRequest->item->user_id === $userId);
         if (!$isRequester && !$isOwner) {
@@ -266,10 +386,8 @@ class ExchangeRequestController extends Controller
             'message' => 'nullable|string|max:2000',
         ]);
 
-        // recipient is the other party
         $toUserId = $isOwner ? $exchangeRequest->requested_by : $exchangeRequest->item->user_id;
 
-        // basic guard: if offered_item_id is present, it must belong to sender
         if ($request->filled('offered_item_id')) {
             $owned = Item::where('id', $request->offered_item_id)
                 ->where('user_id', $userId)->exists();
@@ -278,7 +396,7 @@ class ExchangeRequestController extends Controller
             }
         }
 
-        $offer = TradeOffer::create([
+        TradeOffer::create([
             'exchange_request_id' => $exchangeRequest->id,
             'from_user_id'        => $userId,
             'to_user_id'          => $toUserId,
@@ -288,19 +406,14 @@ class ExchangeRequestController extends Controller
             'status'              => 'pending',
         ]);
 
-        // notify recipient
-        Notification::create([
-            'user_id' => $toUserId,
-            'message' => "New offer on trade '{$exchangeRequest->item->title}'.",
-            'read'    => 0,
-        ]);
+        $itemTitle = $items->hydrateTitle($exchangeRequest->item)?->title ?? 'item';
+        $notifications->push($toUserId, "New offer on trade '{$itemTitle}'.");
 
         return redirect()->route('requests.negotiate', $exchangeRequest->id)
             ->with('success', 'Offer sent.');
     }
 
-    // accept a specific offer (keeps your accept flow consistent)
-    public function acceptOffer($offerId)
+    public function acceptOffer($offerId, ExchangeRequestSecurity $security, NotificationService $notifications, ItemSecurity $items)
     {
         if (!session()->has('user_id')) {
             return redirect('/login')->with('error', 'You must be logged in.');
@@ -309,7 +422,6 @@ class ExchangeRequestController extends Controller
 
         $offer = TradeOffer::with(['exchangeRequest.item.user', 'fromUser', 'toUser'])->findOrFail($offerId);
 
-        // Only recipient can accept
         if ($offer->to_user_id !== $userId) {
             return back()->with('error', 'Unauthorized.');
         }
@@ -318,8 +430,7 @@ class ExchangeRequestController extends Controller
             return back()->with('error', 'Offer already handled.');
         }
 
-        DB::transaction(function () use ($offer) {
-            // mark offer accepted; decline the rest
+        DB::transaction(function () use ($offer, $security, $notifications, $items) {
             $offer->status = 'accepted';
             $offer->save();
 
@@ -328,29 +439,28 @@ class ExchangeRequestController extends Controller
                 ->where('status', 'pending')
                 ->update(['status' => 'declined']);
 
-            // move the request to accepted
             $er = $offer->exchangeRequest;
+            if ($er->encrypted_details && $er->mac) {
+                $security->assertIntegrity($er->encrypted_details, $er->status, $er->mac, $er->completion_payload);
+            }
+
             $er->status = 'accepted';
             if (Schema::hasColumn('exchange_requests', 'accepted_at')) {
                 $er->accepted_at = now();
             }
+            if ($er->encrypted_details) {
+                $er->mac = $security->generateMac($er->encrypted_details, $er->status, $er->completion_payload);
+            }
             $er->save();
 
-            // notify sender (no sensitive contact info here; acceptance notification w/ contact
-            // will be sent by the normal accept() path if the owner uses it,
-            // or you can add it here similarly if you want.)
-            Notification::create([
-                'user_id' => $offer->from_user_id,
-                'message' => "Your offer for '{$er->item->title}' was ACCEPTED.",
-                'read'    => 0,
-            ]);
+            $itemTitle = $items->hydrateTitle($er->item)?->title ?? 'item';
+            $notifications->push($offer->from_user_id, "Your offer for '{$itemTitle}' was ACCEPTED.");
         });
 
         return back()->with('success', 'Offer accepted. The trade is now accepted; you may proceed to complete it after meeting.');
     }
 
-    // decline a specific offer
-    public function declineOffer($offerId)
+    public function declineOffer($offerId, NotificationService $notifications, ItemSecurity $items)
     {
         if (!session()->has('user_id')) {
             return redirect('/login')->with('error', 'You must be logged in.');
@@ -370,11 +480,8 @@ class ExchangeRequestController extends Controller
         $offer->status = 'declined';
         $offer->save();
 
-        Notification::create([
-            'user_id' => $offer->from_user_id,
-            'message' => "Your offer for '{$offer->exchangeRequest->item->title}' was DECLINED.",
-            'read'    => 0,
-        ]);
+        $itemTitle = $items->hydrateTitle($offer->exchangeRequest->item)?->title ?? 'item';
+        $notifications->push($offer->from_user_id, "Your offer for '{$itemTitle}' was DECLINED.");
 
         return back()->with('success', 'Offer declined.');
     }
