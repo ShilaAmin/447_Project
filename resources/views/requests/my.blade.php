@@ -48,8 +48,9 @@
             </div>
           </div>
         </div>
-      @endforeach
+        @endforeach
     </div>
+    <div class="mt-3">{{ $requests->links() }}</div>
   @endif
 </div>
 </body>
