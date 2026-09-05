@@ -2,22 +2,30 @@
 
 namespace App\Http\Controllers;
 
-use Illuminate\Http\Request;
 use App\Models\Notification;
+use App\Services\NotificationService;
 
 class NotificationController extends Controller
 {
-    public function index()
+    public function index(NotificationService $notifications)
     {
         if (!session()->has('user_id')) {
             return redirect('/login')->with('error', 'Please login first.');
         }
 
-        $notifications = Notification::where('user_id', session('user_id'))
+        $paginator = Notification::where('user_id', session('user_id'))
             ->orderBy('created_at', 'desc')
             ->paginate(15);
 
-        return view('notifications.index', compact('notifications'));
+        $paginator->getCollection()->transform(function ($n) use ($notifications) {
+            $hydrated = $notifications->hydrate($n);
+            if (!$hydrated) {
+                $n->setAttribute('message', '[Integrity check failed]');
+            }
+            return $n;
+        });
+
+        return view('notifications.index', ['notifications' => $paginator]);
     }
 
     public function markAsRead($id)
@@ -36,7 +44,6 @@ class NotificationController extends Controller
         return back()->with('success', 'Notification marked as read.');
     }
 
-    // ✅ click-to-mark (GET) — makes the whole card/link mark read in one click
     public function open($id)
     {
         if (!session()->has('user_id')) {
@@ -52,11 +59,9 @@ class NotificationController extends Controller
             $notif->save();
         }
 
-        // If you later add deep links per notification, redirect there.
         return redirect()->route('notifications.index')->with('success', 'Notification opened.');
     }
 
-    // (optional) one-click 'mark all'
     public function markAll()
     {
         if (!session()->has('user_id')) {
