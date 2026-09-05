@@ -9,8 +9,7 @@ class Notification extends Model
 {
     use HasFactory;
 
-    // Using 'read' boolean column to avoid the earlier is_read error
-    protected $fillable = ['user_id', 'message', 'read'];
+    protected $fillable = ['user_id', 'message', 'mac', 'read'];
 
     protected $casts = [
         'read' => 'boolean',
