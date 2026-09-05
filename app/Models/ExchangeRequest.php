@@ -13,8 +13,10 @@ class ExchangeRequest extends Model
         'item_id',
         'requested_by',
         'offered_item_id',
+        'encrypted_details',
+        'mac',
+        'completion_payload',
         'status',
-        // safe to include timestamps if you ever mass-assign; otherwise set directly
         'accepted_at',
         'completed_at',
     ];
