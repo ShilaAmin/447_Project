@@ -407,7 +407,10 @@ class ExchangeRequestController extends Controller
         ]);
 
         $itemTitle = $items->hydrateTitle($exchangeRequest->item)?->title ?? 'item';
-        $notifications->push($toUserId, "New offer on trade '{$itemTitle}'.");
+        $notifications->push(
+        $toUserId,
+        "New offer on trade '{$itemTitle}'. Open Requests → Negotiate to accept or decline.");
+
 
         return redirect()->route('requests.negotiate', $exchangeRequest->id)
             ->with('success', 'Offer sent.');

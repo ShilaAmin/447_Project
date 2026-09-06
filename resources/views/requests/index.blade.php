@@ -52,6 +52,11 @@
                   @csrf
                   <button class="btn btn-primary btn-sm">Mark Complete</button>
                 </form>
+                <a href="{{ route('requests.negotiate',$req->id) }}"
+                      class="btn btn-primary">
+                      Negotiate
+                </a>
+
               @endif
             </div>
           </div>
